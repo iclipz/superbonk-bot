@@ -316,6 +316,9 @@ async function playBattleRound(ctx, battleState) {
     
     const { participants } = battleState;
     
+    // Determine if this is a mega bonk round (applies to all actions in this round)
+    const megaBonk = isMegaBonk();
+    
     // Check if only one participant left (winner!)
     if (participants.length <= 1) {
         if (participants.length === 1) {
@@ -336,8 +339,8 @@ async function playBattleRound(ctx, battleState) {
             
             await ctx.reply(victoryMessage);
             
-            // Update winner stats
-            updateUserStats(groupId, winner.id, winner.username, null, null, false);
+            // Update winner stats - now correctly passing the megaBonk status
+            updateUserStats(groupId, winner.id, winner.username, null, null, megaBonk);
         }
         
         // Cleanup
@@ -345,7 +348,6 @@ async function playBattleRound(ctx, battleState) {
         return;
     }
     
-    const megaBonk = isMegaBonk();
     const eliminationCount = getEliminationCount(participants.length);
     const toEliminate = getEliminatedParticipants(participants, eliminationCount);
     
