@@ -15,6 +15,7 @@
 const { Telegraf } = require('telegraf');
 const fs = require('fs');
 const path = require('path');
+const cron = require('node-cron');
 require('dotenv').config();
 
 // Initialize bot
@@ -99,13 +100,16 @@ function loadClanStorage() {
         console.error('Error loading clan storage:', error);
     }
     return {
-        clans: {},           // clanTag -> { name, groupId, createdAt, totalPoints, memberCount, wins, battles }
+        clans: {},           // clanTag -> { name, groupId, createdAt, totalPoints, memberCount, wins, battles, dailyWins, lastActivity }
         groupClans: {},      // groupId -> clanTag
         globalStats: {
             totalClans: 0,
             totalBattles: 0,
             currentSeason: 1,
-            seasonStartDate: new Date().toISOString()
+            seasonStartDate: new Date().toISOString(),
+            dailyWinHistory: [], // Array of { date, winnerClan, totalActiveCans }
+            lastDailyWinner: null,
+            lastDailyWinDate: null
         }
     };
 }
@@ -151,6 +155,18 @@ function getClanForGroup(groupId) {
     return clanData.groupClans[groupId] || null;
 }
 
+// Update clan activity (call whenever bot is used in a group)
+function updateClanActivity(groupId) {
+    const clanTag = getClanForGroup(groupId);
+    if (!clanTag) return; // Group doesn't have a clan
+    
+    const clanData = loadClanStorage();
+    if (clanData.clans[clanTag]) {
+        clanData.clans[clanTag].lastActivity = new Date().toISOString();
+        saveClanStorage(clanData);
+    }
+}
+
 // Update clan stats
 function updateClanStats(groupId, pointsToAdd = 1) {
     const clanTag = getClanForGroup(groupId);
@@ -161,8 +177,96 @@ function updateClanStats(groupId, pointsToAdd = 1) {
         clanData.clans[clanTag].totalPoints += pointsToAdd;
         clanData.clans[clanTag].wins += 1;
         clanData.clans[clanTag].battles += 1;
+        clanData.clans[clanTag].lastActivity = new Date().toISOString(); // Update activity on battle win
         clanData.globalStats.totalBattles += 1;
         saveClanStorage(clanData);
+    }
+}
+
+// Get active clans (used bot within last 24 hours)
+function getActiveClans() {
+    const clanData = loadClanStorage();
+    const now = new Date();
+    const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    
+    const activeClans = [];
+    
+    for (const [clanTag, clan] of Object.entries(clanData.clans)) {
+        const lastActivity = new Date(clan.lastActivity);
+        if (lastActivity > twentyFourHoursAgo) {
+            activeClans.push({ tag: clanTag, ...clan });
+        }
+    }
+    
+    return activeClans;
+}
+
+// Select daily clan winner
+async function selectDailyWinner() {
+    const clanData = loadClanStorage();
+    const today = new Date().toDateString();
+    
+    // Check if we already selected a winner today
+    if (clanData.globalStats.lastDailyWinDate === today) {
+        console.log('Daily winner already selected for today');
+        return null;
+    }
+    
+    const activeClans = getActiveClans();
+    
+    if (activeClans.length === 0) {
+        console.log('No active clans found for daily winner selection');
+        return null;
+    }
+    
+    // Random selection
+    const randomIndex = Math.floor(Math.random() * activeClans.length);
+    const winner = activeClans[randomIndex];
+    
+    // Update winner stats
+    clanData.clans[winner.tag].dailyWins += 1;
+    
+    // Update global stats
+    clanData.globalStats.lastDailyWinner = winner.tag;
+    clanData.globalStats.lastDailyWinDate = today;
+    
+    // Add to history
+    clanData.globalStats.dailyWinHistory.push({
+        date: today,
+        winnerClan: winner.tag,
+        totalActiveClans: activeClans.length
+    });
+    
+    // Keep only last 30 days of history
+    if (clanData.globalStats.dailyWinHistory.length > 30) {
+        clanData.globalStats.dailyWinHistory = clanData.globalStats.dailyWinHistory.slice(-30);
+    }
+    
+    saveClanStorage(clanData);
+    
+    console.log(`Daily winner selected: [${winner.tag}] from ${activeClans.length} active clans`);
+    
+    // Send announcements to all groups with clans
+    await announceDailyWinner(winner.tag, activeClans.length);
+    
+    return winner;
+}
+
+// Announce daily winner to all groups
+async function announceDailyWinner(winnerTag, totalActiveClans) {
+    const clanData = loadClanStorage();
+    
+    for (const [groupId, clanTag] of Object.entries(clanData.groupClans)) {
+        try {
+            const isWinner = clanTag === winnerTag;
+            const message = isWinner 
+                ? `🏆⚔️ DAILY CLAN VICTORY! ⚔️🏆\n\n🎉 Congratulations! [${winnerTag}] has been selected as today's DAILY WINNER!\n\n🎲 Selected from ${totalActiveClans} active clans worldwide!\n🔥 +1 Daily Win Point earned!\n\n⚔️ Use /global to see the updated clan leaderboard!`
+                : `🎯 Daily Clan Winner Selected! 🎯\n\n👑 Today's winner: [${winnerTag}]\n🎲 Selected from ${totalActiveClans} active clans\n\n💪 Keep using the bot daily to stay active and increase your chances!\n⚔️ Use /global to see the clan leaderboard!`;
+            
+            await bot.telegram.sendMessage(groupId, message);
+        } catch (error) {
+            console.error(`Failed to send daily winner announcement to group ${groupId}:`, error);
+        }
     }
 }
 
@@ -399,6 +503,7 @@ bot.command('createclan', async (ctx) => {
     }
     
     const groupId = ctx.chat.id.toString();
+    updateClanActivity(groupId); // Track activity
     const args = ctx.message.text.split(' ').slice(1);
     
     if (args.length === 0) {
@@ -433,7 +538,9 @@ bot.command('createclan', async (ctx) => {
         totalPoints: 0,
         memberCount: 0,
         wins: 0,
-        battles: 0
+        battles: 0,
+        dailyWins: 0,
+        lastActivity: new Date().toISOString()
     };
     
     clanData.groupClans[groupId] = clanTag;
@@ -451,6 +558,7 @@ bot.command('rank', async (ctx) => {
     }
     
     const groupId = ctx.chat.id.toString();
+    updateClanActivity(groupId); // Track activity
     const clanTag = getClanForGroup(groupId);
     
     if (!clanTag) {
@@ -467,16 +575,18 @@ bot.command('rank', async (ctx) => {
     // Calculate clan ranking
     const allClans = Object.entries(clanData.clans)
         .map(([tag, data]) => ({ tag, ...data }))
-        .sort((a, b) => b.totalPoints - a.totalPoints);
+        .sort((a, b) => b.dailyWins - a.dailyWins);
     
     const rank = allClans.findIndex(c => c.tag === clanTag) + 1;
+    const lastActivity = new Date(clan.lastActivity).toLocaleDateString();
     
     const message = `⚔️ CLAN [${clanTag}] STATS ⚔️\n\n` +
                    `🏆 Global Rank: #${rank} of ${allClans.length}\n` +
-                   `💎 Total Points: ${clan.totalPoints}\n` +
-                   `🎯 Victories: ${clan.wins}\n` +
-                   `⚔️ Battles: ${clan.battles}\n` +
-                   `📅 Created: ${new Date(clan.createdAt).toLocaleDateString()}\n\n` +
+                   `🎯 Daily Wins: ${clan.dailyWins}\n` +
+                   `⚔️ Battle Royale Wins: ${clan.wins}\n` +
+                   `📅 Created: ${new Date(clan.createdAt).toLocaleDateString()}\n` +
+                   `🕒 Last Active: ${lastActivity}\n\n` +
+                   `🎲 Daily winners are selected randomly from active clans!\n` +
                    `🌍 Compete against ${allClans.length - 1} other clans worldwide!`;
     
     await ctx.reply(message);
@@ -492,14 +602,15 @@ bot.command('global', async (ctx) => {
     
     const allClans = Object.entries(clanData.clans)
         .map(([tag, data]) => ({ tag, ...data }))
-        .sort((a, b) => b.totalPoints - a.totalPoints)
+        .sort((a, b) => b.dailyWins - a.dailyWins)
         .slice(0, 20);
     
-    let message = '🌍⚔️ GLOBAL CLAN LEADERBOARD ⚔️🌍\n\n';
+    let message = '🌍⚔️ GLOBAL CLAN LEADERBOARD ⚔️🌍\n🎯 Ranked by Daily Wins (Random Daily Selection)\n\n';
     
     allClans.forEach((clan, index) => {
         const trophy = index === 0 ? '👑' : index === 1 ? '🥈' : index === 2 ? '🥉' : '⚔️';
-        message += `${trophy} [${clan.tag}] – ${clan.totalPoints} Points (${clan.wins} wins)\n`;
+        const lastActivity = new Date(clan.lastActivity).toLocaleDateString();
+        message += `${trophy} [${clan.tag}] – ${clan.dailyWins} Daily Wins (Last active: ${lastActivity})\n`;
     });
     
     message += `\n🔥 ${allClans.length} clans competing worldwide!\n💀 Create your clan: /createclan ABCD`;
@@ -524,17 +635,18 @@ bot.command('clansearch', async (ctx) => {
         // Calculate ranking
         const allClans = Object.entries(clanData.clans)
             .map(([tag, data]) => ({ tag, ...data }))
-            .sort((a, b) => b.totalPoints - a.totalPoints);
+            .sort((a, b) => b.dailyWins - a.dailyWins);
         
         const rank = allClans.findIndex(c => c.tag === searchTag) + 1;
+        const lastActivity = new Date(clan.lastActivity).toLocaleDateString();
         
         const message = `🔍 CLAN FOUND: [${searchTag}] 🔍\n\n` +
                        `🏆 Global Rank: #${rank} of ${allClans.length}\n` +
-                       `💎 Total Points: ${clan.totalPoints}\n` +
-                       `🎯 Victories: ${clan.wins}\n` +
-                       `⚔️ Total Battles: ${clan.battles}\n` +
-                       `📅 Created: ${new Date(clan.createdAt).toLocaleDateString()}\n\n` +
-                       `⚔️ This clan is actively competing in the global wars!`;
+                       `🎯 Daily Wins: ${clan.dailyWins}\n` +
+                       `⚔️ Battle Royale Wins: ${clan.wins}\n` +
+                       `📅 Created: ${new Date(clan.createdAt).toLocaleDateString()}\n` +
+                       `🕒 Last Active: ${lastActivity}\n\n` +
+                       `🎲 Daily winners selected randomly from active clans!`;
         
         await ctx.reply(message);
     } else {
@@ -549,6 +661,8 @@ bot.command('jail', async (ctx) => {
         return ctx.reply('You can only send people to horny jail in group chats! 🚔');
     }
     
+    const groupId = ctx.chat.id.toString();
+    updateClanActivity(groupId); // Track activity
     const senderId = ctx.from.id.toString();
     const senderUsername = ctx.from.username || ctx.from.first_name || 'Unknown';
     
@@ -602,6 +716,7 @@ bot.command('bonk', async (ctx) => {
     }
     
     const groupId = ctx.chat.id.toString();
+    updateClanActivity(groupId); // Track activity
     const userId = ctx.from.id.toString();
     const username = ctx.from.username || ctx.from.first_name || 'Unknown';
     
@@ -676,6 +791,7 @@ bot.command('leaderboard', async (ctx) => {
     }
     
     const groupId = ctx.chat.id.toString();
+    updateClanActivity(groupId); // Track activity
     const leaderboard = getLeaderboard(groupId);
     
     if (leaderboard.length === 0) {
@@ -689,6 +805,47 @@ bot.command('leaderboard', async (ctx) => {
         const streak = user.streak > 0 ? ` 🔥${user.streak}` : '';
         message += `${trophy} @${user.username} – ${user.wins} Wins${streak}\n`;
     });
+    
+    await ctx.reply(message);
+});
+
+// Command: /dailywinner - Show today's daily winner
+bot.command('dailywinner', async (ctx) => {
+    const clanData = loadClanStorage();
+    const today = new Date().toDateString();
+    
+    if (clanData.globalStats.lastDailyWinDate === today) {
+        const winner = clanData.globalStats.lastDailyWinner;
+        const winnerClan = clanData.clans[winner];
+        const totalActiveClans = getActiveClans().length;
+        
+        await ctx.reply(`🏆 TODAY'S DAILY CLAN WINNER 🏆\n\n👑 Winner: [${winner}]\n🎲 Selected from ${totalActiveClans} active clans\n🕐 Selected at 12:00 PM UTC\n\n⚔️ Use /global to see updated leaderboard!\n💪 Use the bot daily to keep your clan active!`);
+    } else {
+        const activeClans = getActiveClans();
+        await ctx.reply(`⏰ NO WINNER SELECTED YET TODAY ⏰\n\n🎯 Current active clans: ${activeClans.length}\n🕐 Next selection: 12:00 PM UTC\n\n💪 Use the bot to keep your clan active and eligible!\n📊 Active = used bot within last 24 hours`);
+    }
+});
+
+// Command: /dailyhistory - Show recent daily winner history
+bot.command('dailyhistory', async (ctx) => {
+    const clanData = loadClanStorage();
+    const history = clanData.globalStats.dailyWinHistory || [];
+    
+    if (history.length === 0) {
+        return ctx.reply('📚 NO DAILY HISTORY YET 📚\n\nDaily winner selection starts once clans are created!\n\n⚔️ Create a clan: /createclan ABCD\n🕐 Winners selected daily at 12:00 PM UTC');
+    }
+    
+    let message = '📚⚔️ RECENT DAILY WINNERS ⚔️📚\n\n';
+    
+    // Show last 10 days
+    const recentHistory = history.slice(-10).reverse();
+    
+    recentHistory.forEach((entry, index) => {
+        const icon = index === 0 ? '🏆' : '📅';
+        message += `${icon} ${entry.date}: [${entry.winnerClan}] (${entry.totalActiveClans} active clans)\n`;
+    });
+    
+    message += `\n🎯 Showing last ${recentHistory.length} days\n🎲 Winners selected randomly from active clans\n⚔️ Use /global for current leaderboard`;
     
     await ctx.reply(message);
 });
@@ -754,15 +911,22 @@ bot.command('help', async (ctx) => {
                        `🌍 CLAN WAR COMMANDS:\n` +
                        `• /createclan ABCD - Create a 4-letter clan tag\n` +
                        `• /rank - View your clan's global ranking\n` +
-                       `• /global - Top clans worldwide\n` +
+                       `• /global - Top clans worldwide (by daily wins)\n` +
                        `• /clansearch ABCD - Find info about any clan\n\n` +
+                       `🎲 DAILY WINNER COMMANDS:\n` +
+                       `• /dailywinner - See today's randomly selected clan winner\n` +
+                       `• /dailyhistory - View recent daily winner history\n\n` +
                        `🎯 HOW IT WORKS:\n` +
                        `• Type /bonk to start a battle royale\n` +
                        `• Others type /bonk to join (30 sec window)\n` +
                        `• More players = lower win chance but MORE CHAOS!\n` +
                        `• Random elimination each round until 1 survives\n` +
-                       `• 5% chance for MEGA BONK chaos! 💥\n` +
-                       `• Victories earn points for your clan in global wars!\n\n` +
+                       `• 5% chance for MEGA BONK chaos! 💥\n\n` +
+                       `🏆 DAILY CLAN SYSTEM:\n` +
+                       `• Every day at 12 PM UTC, one random active clan wins!\n` +
+                       `• Active = used bot within last 24 hours\n` +
+                       `• More active clans = lower chance but more competition!\n` +
+                       `• Leaderboard ranked by daily wins, not battle wins!\n\n` +
                        `⚔️ Ready for the ultimate BONK battle? ⚔️`;
     
     await ctx.reply(helpMessage);
@@ -789,6 +953,20 @@ async function startBot() {
     try {
         await bot.launch();
         console.log('🔥⚔️ SUPERBONK Battle Royale Bot is running! Ready for chaos! ⚔️🔥');
+        
+        // Schedule daily clan winner selection (runs at 12:00 PM UTC daily)
+        cron.schedule('0 12 * * *', async () => {
+            console.log('Running daily clan winner selection...');
+            try {
+                await selectDailyWinner();
+            } catch (error) {
+                console.error('Error during daily winner selection:', error);
+            }
+        }, {
+            timezone: "UTC"
+        });
+        
+        console.log('📅 Daily clan winner selection scheduled for 12:00 PM UTC');
         
         // Graceful shutdown
         process.once('SIGINT', () => bot.stop('SIGINT'));
