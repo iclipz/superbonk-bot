@@ -18,10 +18,14 @@ const path = require('path');
 require('dotenv').config();
 
 // Initialize bot with fallback for Railway
+console.log('All environment variables:', Object.keys(process.env));
+console.log('BOT_TOKEN exists:', !!process.env.BOT_TOKEN);
+console.log('BOT_TOKEN length:', process.env.BOT_TOKEN ? process.env.BOT_TOKEN.length : 0);
+
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
     console.error('BOT_TOKEN environment variable is not set!');
-    console.log('Available environment variables:', Object.keys(process.env).filter(key => key.includes('BOT')));
+    console.log('Available environment variables:', Object.keys(process.env));
     process.exit(1);
 }
 
