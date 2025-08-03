@@ -4,8 +4,9 @@
 # Node modules
 node_modules/
 
-# Storage file
+# Storage files
 bonk_data.json
+clan_data.json
 
 # Logs
 *.log

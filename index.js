@@ -26,8 +26,9 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// Storage file path
+// Storage file paths
 const STORAGE_FILE = path.join(__dirname, 'bonk_data.json');
+const CLAN_STORAGE_FILE = path.join(__dirname, 'clan_data.json');
 
 // Active battle royales tracker (in-memory)
 const activeBattles = new Map(); // groupId -> { participants: [], startTime, battleState }
@@ -56,6 +57,17 @@ const MEGA_BONK_MESSAGES = [
     "🚀💥 ULTRA MEGA BONK! 💥🚀 Chaos erupts in the arena! 🛸🌍"
 ];
 
+const JAIL_MESSAGES = [
+    "🔨🚔 BONK! @{target} has been sent to horny jail! 🚔🔨\n\n🐶 No escape! Serve your time! 🔒",
+    "🚔⚡ MEGA BONK! @{target} is sentenced to MAXIMUM SECURITY horny jail! ⚡🚔\n\n🚨 This is a CODE RED horny emergency! 🚨",
+    "🔨💀 ULTRA BONK! @{target} has been banished to the shadow realm horny jail! 💀🔨\n\n👻 You brought this upon yourself! 👻",
+    "🚔🔥 BONK POLICE! @{target} is under arrest for excessive horniness! 🔥🚔\n\n📜 Charges: Being too bonkable! 📜",
+    "🔨⚖️ JUSTICE BONK! @{target} sentenced to life in horny jail! ⚖️🔨\n\n🏛️ The BONK court has spoken! 🏛️",
+    "🚔💥 CRITICAL BONK! @{target} has been YEETED to horny jail! 💥🚔\n\n🌪️ That's what you get for being sus! 🌪️",
+    "🔨🎯 PRECISION BONK! @{target} locked up in the highest security horny facility! 🎯🔨\n\n🔐 Key has been thrown away! 🔐",
+    "🚔🌊 TSUNAMI BONK! @{target} has been washed away to horny jail island! 🌊🚔\n\n🏝️ Population: You! 🏝️"
+];
+
 // Load or create storage
 function loadStorage() {
     try {
@@ -74,6 +86,36 @@ function saveStorage(data) {
         fs.writeFileSync(STORAGE_FILE, JSON.stringify(data, null, 2));
     } catch (error) {
         console.error('Error saving storage:', error);
+    }
+}
+
+// Load or create clan storage
+function loadClanStorage() {
+    try {
+        if (fs.existsSync(CLAN_STORAGE_FILE)) {
+            return JSON.parse(fs.readFileSync(CLAN_STORAGE_FILE, 'utf8'));
+        }
+    } catch (error) {
+        console.error('Error loading clan storage:', error);
+    }
+    return {
+        clans: {},           // clanTag -> { name, groupId, createdAt, totalPoints, memberCount, wins, battles }
+        groupClans: {},      // groupId -> clanTag
+        globalStats: {
+            totalClans: 0,
+            totalBattles: 0,
+            currentSeason: 1,
+            seasonStartDate: new Date().toISOString()
+        }
+    };
+}
+
+// Save clan storage
+function saveClanStorage(data) {
+    try {
+        fs.writeFileSync(CLAN_STORAGE_FILE, JSON.stringify(data, null, 2));
+    } catch (error) {
+        console.error('Error saving clan storage:', error);
     }
 }
 
@@ -103,6 +145,27 @@ function getUserData(groupId, userId, username) {
     return storage[groupId][userId];
 }
 
+// Get clan for group
+function getClanForGroup(groupId) {
+    const clanData = loadClanStorage();
+    return clanData.groupClans[groupId] || null;
+}
+
+// Update clan stats
+function updateClanStats(groupId, pointsToAdd = 1) {
+    const clanTag = getClanForGroup(groupId);
+    if (!clanTag) return; // Group doesn't have a clan
+    
+    const clanData = loadClanStorage();
+    if (clanData.clans[clanTag]) {
+        clanData.clans[clanTag].totalPoints += pointsToAdd;
+        clanData.clans[clanTag].wins += 1;
+        clanData.clans[clanTag].battles += 1;
+        clanData.globalStats.totalBattles += 1;
+        saveClanStorage(clanData);
+    }
+}
+
 // Update user stats
 function updateUserStats(groupId, winnerId, winnerUsername, loserId = null, loserUsername = null, isMegaBonk = false) {
     const storage = loadStorage();
@@ -127,8 +190,11 @@ function updateUserStats(groupId, winnerId, winnerUsername, loserId = null, lose
         }
     }
     
+    // Calculate points for win
+    const pointsEarned = isMegaBonk ? 2 : 1; // MEGA BONK gives double points
+    
     // Update winner stats
-    storage[groupId][winnerId].wins += isMegaBonk ? 2 : 1; // MEGA BONK gives double points
+    storage[groupId][winnerId].wins += pointsEarned;
     storage[groupId][winnerId].streak += 1;
     
     // Update loser (if provided - for 1v1 compatibility)
@@ -152,7 +218,9 @@ function updateUserStats(groupId, winnerId, winnerUsername, loserId = null, lose
     }
     
     saveStorage(storage);
-    // console.log(`Updated stats for winner ${winnerUsername} in group ${groupId}:`, storage[groupId][winnerId]);
+    
+    // Update clan stats if group has a clan
+    updateClanStats(groupId, pointsEarned);
 }
 
 // Get leaderboard
@@ -258,7 +326,15 @@ async function playBattleRound(ctx, battleState) {
                 ''
             );
             
-            await ctx.reply(`🏆⚔️ BATTLE ROYALE COMPLETE! ⚔️🏆\n${message}\n\n🎉 Victory earned! +1 win! 🎉`);
+            // Check if group has a clan for clan points message
+            const clanTag = getClanForGroup(groupId);
+            let victoryMessage = `🏆⚔️ BATTLE ROYALE COMPLETE! ⚔️🏆\n${message}\n\n🎉 Victory earned! +${megaBonk ? 2 : 1} ${megaBonk ? 'points' : 'point'}! 🎉`;
+            
+            if (clanTag) {
+                victoryMessage += `\n⚔️ +${megaBonk ? 2 : 1} point${megaBonk ? 's' : ''} for clan [${clanTag}]! 🌍`;
+            }
+            
+            await ctx.reply(victoryMessage);
             
             // Update winner stats
             updateUserStats(groupId, winner.id, winner.username, null, null, false);
@@ -312,6 +388,209 @@ async function playBattleRound(ctx, battleState) {
         setTimeout(() => playBattleRound(ctx, battleState), 2000);
     }
 }
+
+// Command: /createclan - Create a clan for this group
+bot.command('createclan', async (ctx) => {
+    // Only work in groups
+    if (ctx.chat.type === 'private') {
+        return ctx.reply('Clans can only be created in group chats! 🤖');
+    }
+    
+    const groupId = ctx.chat.id.toString();
+    const args = ctx.message.text.split(' ').slice(1);
+    
+    if (args.length === 0) {
+        return ctx.reply('🏷️ Please specify a 4-letter clan tag!\n\nUsage: /createclan BONK\n\n⚔️ Clan tags must be exactly 4 letters and unique!');
+    }
+    
+    const clanTag = args[0].toUpperCase();
+    
+    // Validate clan tag
+    if (clanTag.length !== 4 || !/^[A-Z]{4}$/.test(clanTag)) {
+        return ctx.reply('❌ Clan tag must be exactly 4 letters (A-Z only)!\n\nExample: /createclan BONK');
+    }
+    
+    const clanData = loadClanStorage();
+    
+    // Check if group already has a clan
+    if (clanData.groupClans[groupId]) {
+        const existingTag = clanData.groupClans[groupId];
+        return ctx.reply(`⚔️ This group already has clan tag: [${existingTag}]\n\nUse /rank to see your clan info!`);
+    }
+    
+    // Check if clan tag is taken
+    if (clanData.clans[clanTag]) {
+        return ctx.reply(`❌ Clan tag [${clanTag}] is already taken!\n\nTry a different 4-letter combination.`);
+    }
+    
+    // Create the clan
+    clanData.clans[clanTag] = {
+        name: clanTag,
+        groupId: groupId,
+        createdAt: new Date().toISOString(),
+        totalPoints: 0,
+        memberCount: 0,
+        wins: 0,
+        battles: 0
+    };
+    
+    clanData.groupClans[groupId] = clanTag;
+    clanData.globalStats.totalClans += 1;
+    
+    saveClanStorage(clanData);
+    
+    await ctx.reply(`🔥⚔️ CLAN [${clanTag}] CREATED! ⚔️🔥\n\n🏷️ Your group is now part of the global SUPERBONK clan wars!\n📊 Use /rank to see your progress\n🌍 Use /global to see all clans\n\n💀 Every battle royale victory now earns points for your clan! Let the wars begin!`);
+});
+
+// Command: /rank - Show clan statistics
+bot.command('rank', async (ctx) => {
+    if (ctx.chat.type === 'private') {
+        return ctx.reply('Clan stats are only available in group chats! 🤖');
+    }
+    
+    const groupId = ctx.chat.id.toString();
+    const clanTag = getClanForGroup(groupId);
+    
+    if (!clanTag) {
+        return ctx.reply('❌ This group doesn\'t have a clan yet!\n\nCreate one with: /createclan ABCD\n\n⚔️ Join the global clan wars!');
+    }
+    
+    const clanData = loadClanStorage();
+    const clan = clanData.clans[clanTag];
+    
+    if (!clan) {
+        return ctx.reply('❌ Clan data not found! Please contact support.');
+    }
+    
+    // Calculate clan ranking
+    const allClans = Object.entries(clanData.clans)
+        .map(([tag, data]) => ({ tag, ...data }))
+        .sort((a, b) => b.totalPoints - a.totalPoints);
+    
+    const rank = allClans.findIndex(c => c.tag === clanTag) + 1;
+    
+    const message = `⚔️ CLAN [${clanTag}] STATS ⚔️\n\n` +
+                   `🏆 Global Rank: #${rank} of ${allClans.length}\n` +
+                   `💎 Total Points: ${clan.totalPoints}\n` +
+                   `🎯 Victories: ${clan.wins}\n` +
+                   `⚔️ Battles: ${clan.battles}\n` +
+                   `📅 Created: ${new Date(clan.createdAt).toLocaleDateString()}\n\n` +
+                   `🌍 Compete against ${allClans.length - 1} other clans worldwide!`;
+    
+    await ctx.reply(message);
+});
+
+// Command: /global - Show global clan rankings
+bot.command('global', async (ctx) => {
+    const clanData = loadClanStorage();
+    
+    if (Object.keys(clanData.clans).length === 0) {
+        return ctx.reply('🌍 No clans exist yet!\n\nBe the first to create one: /createclan ABCD\n\n⚔️ Start the global clan wars!');
+    }
+    
+    const allClans = Object.entries(clanData.clans)
+        .map(([tag, data]) => ({ tag, ...data }))
+        .sort((a, b) => b.totalPoints - a.totalPoints)
+        .slice(0, 20);
+    
+    let message = '🌍⚔️ GLOBAL CLAN LEADERBOARD ⚔️🌍\n\n';
+    
+    allClans.forEach((clan, index) => {
+        const trophy = index === 0 ? '👑' : index === 1 ? '🥈' : index === 2 ? '🥉' : '⚔️';
+        message += `${trophy} [${clan.tag}] – ${clan.totalPoints} Points (${clan.wins} wins)\n`;
+    });
+    
+    message += `\n🔥 ${allClans.length} clans competing worldwide!\n💀 Create your clan: /createclan ABCD`;
+    
+    await ctx.reply(message);
+});
+
+// Command: /clansearch - Search for clans by tag
+bot.command('clansearch', async (ctx) => {
+    const args = ctx.message.text.split(' ').slice(1);
+    
+    if (args.length === 0) {
+        return ctx.reply('🔍 Please specify a clan tag to search for!\n\nUsage: /clansearch BONK');
+    }
+    
+    const searchTag = args[0].toUpperCase();
+    const clanData = loadClanStorage();
+    
+    if (clanData.clans[searchTag]) {
+        const clan = clanData.clans[searchTag];
+        
+        // Calculate ranking
+        const allClans = Object.entries(clanData.clans)
+            .map(([tag, data]) => ({ tag, ...data }))
+            .sort((a, b) => b.totalPoints - a.totalPoints);
+        
+        const rank = allClans.findIndex(c => c.tag === searchTag) + 1;
+        
+        const message = `🔍 CLAN FOUND: [${searchTag}] 🔍\n\n` +
+                       `🏆 Global Rank: #${rank} of ${allClans.length}\n` +
+                       `💎 Total Points: ${clan.totalPoints}\n` +
+                       `🎯 Victories: ${clan.wins}\n` +
+                       `⚔️ Total Battles: ${clan.battles}\n` +
+                       `📅 Created: ${new Date(clan.createdAt).toLocaleDateString()}\n\n` +
+                       `⚔️ This clan is actively competing in the global wars!`;
+        
+        await ctx.reply(message);
+    } else {
+        await ctx.reply(`❌ Clan tag [${searchTag}] not found!\n\n🔍 Search is case-insensitive\n💭 Maybe they haven't created a clan yet?\n⚔️ View all clans: /global`);
+    }
+});
+
+// Command: /jail - Send someone to horny jail
+bot.command('jail', async (ctx) => {
+    // Only work in groups
+    if (ctx.chat.type === 'private') {
+        return ctx.reply('You can only send people to horny jail in group chats! 🚔');
+    }
+    
+    const senderId = ctx.from.id.toString();
+    const senderUsername = ctx.from.username || ctx.from.first_name || 'Unknown';
+    
+    let targetUsername = null;
+    let targetUserId = null;
+    
+    // Check if replying to a message
+    if (ctx.message.reply_to_message) {
+        const repliedUser = ctx.message.reply_to_message.from;
+        targetUserId = repliedUser.id.toString();
+        targetUsername = repliedUser.username || repliedUser.first_name || 'Unknown';
+    } else {
+        // Parse mentioned user from command text
+        const commandText = ctx.message.text;
+        const mentionMatch = commandText.match(/@(\w+)/);
+        
+        if (mentionMatch) {
+            targetUsername = mentionMatch[1];
+        }
+    }
+    
+    if (!targetUsername) {
+        return ctx.reply('🚔 Who should I send to horny jail? 🚔\n\nUsage:\n• /jail @username\n• Reply to a message with /jail\n\n🔨 Time to dispense some justice! 🔨');
+    }
+    
+    // Prevent self-jailing
+    if (targetUsername === senderUsername || targetUserId === senderId) {
+        return ctx.reply('🤔 You can\'t send yourself to horny jail!\n\n🔨 That\'s not how this works! Find someone else to BONK! 🔨');
+    }
+    
+    // Prevent jailing the bot
+    if (targetUsername.toLowerCase().includes('superbonk') || targetUsername.toLowerCase().includes('bot')) {
+        return ctx.reply('🤖 Nice try, but you can\'t jail the BONK POLICE! 🚔\n\n⚡ I AM THE LAW! ⚡');
+    }
+    
+    // Select random jail message
+    const jailMessage = JAIL_MESSAGES[Math.floor(Math.random() * JAIL_MESSAGES.length)];
+    const formattedMessage = jailMessage.replace(/{target}/g, targetUsername);
+    
+    // Add sender credit
+    const fullMessage = formattedMessage + `\n\n👮‍♂️ Arrest made by: @${senderUsername}`;
+    
+    await ctx.reply(fullMessage);
+});
 
 // Command: /bonk - Join or start battle royale
 bot.command('bonk', async (ctx) => {
@@ -464,16 +743,24 @@ bot.command('bonkstats', async (ctx) => {
 // Help command
 bot.command('help', async (ctx) => {
     const helpMessage = `🔥⚔️ SUPERBONK BATTLE ROYALE BOT ⚔️🔥\n\n` +
-                       `💀 /bonk - Start or join a battle royale!\n` +
-                       `🏆 /leaderboard - View group leaderboard\n` +
-                       `📊 /bonkstats [@username] - View battle stats\n` +
-                       `❓ /help - Show this message\n\n` +
+                       `💀 BATTLE COMMANDS:\n` +
+                       `• /bonk - Start or join a battle royale!\n` +
+                       `• /leaderboard - View group leaderboard\n` +
+                       `• /bonkstats [@username] - View battle stats\n\n` +
+                       `🚔 FUN COMMANDS:\n` +
+                       `• /jail @username - Send someone to horny jail!\n\n` +
+                       `🌍 CLAN WAR COMMANDS:\n` +
+                       `• /createclan ABCD - Create a 4-letter clan tag\n` +
+                       `• /rank - View your clan's global ranking\n` +
+                       `• /global - Top clans worldwide\n` +
+                       `• /clansearch ABCD - Find info about any clan\n\n` +
                        `🎯 HOW IT WORKS:\n` +
                        `• Type /bonk to start a battle royale\n` +
                        `• Others type /bonk to join (30 sec window)\n` +
                        `• More players = lower win chance but MORE CHAOS!\n` +
                        `• Random elimination each round until 1 survives\n` +
-                       `• 5% chance for MEGA BONK chaos! 💥\n\n` +
+                       `• 5% chance for MEGA BONK chaos! 💥\n` +
+                       `• Victories earn points for your clan in global wars!\n\n` +
                        `⚔️ Ready for the ultimate BONK battle? ⚔️`;
     
     await ctx.reply(helpMessage);
