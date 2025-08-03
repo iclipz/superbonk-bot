@@ -30,6 +30,7 @@ const bot = new Telegraf(BOT_TOKEN);
 
 // Database configuration
 console.log('🔍 DATABASE_URL:', process.env.DATABASE_URL ? 'SET' : 'NOT SET');
+console.log('🔍 DATABASE_URL VALUE:', process.env.DATABASE_URL);
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
