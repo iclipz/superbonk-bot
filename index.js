@@ -16,6 +16,7 @@ const { Telegraf } = require('telegraf');
 const fs = require('fs');
 const path = require('path');
 const cron = require('node-cron');
+const { Pool } = require('pg');
 require('dotenv').config();
 
 // Initialize bot
@@ -27,7 +28,22 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// Storage file paths
+// Database configuration
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Test database connection
+pool.on('connect', () => {
+    console.log('🗄️ Connected to PostgreSQL database');
+});
+
+pool.on('error', (err) => {
+    console.error('PostgreSQL connection error:', err);
+});
+
+// Legacy storage file paths (for migration reference)
 const STORAGE_FILE = path.join(__dirname, 'bonk_data.json');
 const CLAN_STORAGE_FILE = path.join(__dirname, 'clan_data.json');
 
@@ -69,7 +85,96 @@ const JAIL_MESSAGES = [
     "🚔🌊 TSUNAMI BONK! @{target} has been washed away to horny jail island! 🌊🚔\n\n🏝️ Population: You! 🏝️"
 ];
 
-// Load or create storage
+// Initialize database schema
+async function initializeDatabase() {
+    const client = await pool.connect();
+    try {
+        // Create users table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                group_id VARCHAR(255) NOT NULL,
+                user_id VARCHAR(255) NOT NULL,
+                username VARCHAR(255) NOT NULL,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                streak INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(group_id, user_id)
+            )
+        `);
+
+        // Create clans table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS clans (
+                id SERIAL PRIMARY KEY,
+                clan_tag VARCHAR(4) UNIQUE NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                group_id VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                total_points INTEGER DEFAULT 0,
+                member_count INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                battles INTEGER DEFAULT 0,
+                daily_wins INTEGER DEFAULT 0,
+                last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // Create group_clans mapping table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS group_clans (
+                id SERIAL PRIMARY KEY,
+                group_id VARCHAR(255) UNIQUE NOT NULL,
+                clan_tag VARCHAR(4) NOT NULL,
+                FOREIGN KEY (clan_tag) REFERENCES clans(clan_tag) ON DELETE CASCADE
+            )
+        `);
+
+        // Create global_stats table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS global_stats (
+                id SERIAL PRIMARY KEY,
+                total_clans INTEGER DEFAULT 0,
+                total_battles INTEGER DEFAULT 0,
+                current_season INTEGER DEFAULT 1,
+                season_start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_daily_winner VARCHAR(4),
+                last_daily_win_date DATE
+            )
+        `);
+
+        // Create daily_win_history table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS daily_win_history (
+                id SERIAL PRIMARY KEY,
+                date DATE NOT NULL,
+                winner_clan VARCHAR(4) NOT NULL,
+                total_active_clans INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // Initialize global stats if empty
+        const globalStats = await client.query('SELECT COUNT(*) FROM global_stats');
+        if (parseInt(globalStats.rows[0].count) === 0) {
+            await client.query(`
+                INSERT INTO global_stats (total_clans, total_battles, current_season, season_start_date)
+                VALUES (0, 0, 1, CURRENT_TIMESTAMP)
+            `);
+        }
+
+        console.log('✅ Database schema initialized successfully');
+    } catch (error) {
+        console.error('❌ Error initializing database:', error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Load or create storage (LEGACY - will be replaced)
 function loadStorage() {
     try {
         if (fs.existsSync(STORAGE_FILE)) {
@@ -124,221 +229,290 @@ function saveClanStorage(data) {
 }
 
 // Get or create user data
-function getUserData(groupId, userId, username) {
-    const storage = loadStorage();
-    
-    if (!storage[groupId]) {
-        storage[groupId] = {};
-    }
-    
-    if (!storage[groupId][userId]) {
-        storage[groupId][userId] = {
-            username: username || 'Unknown',
-            wins: 0,
-            losses: 0,
-            streak: 0
-        };
-    } else {
-        // Update username if provided
-        if (username) {
-            storage[groupId][userId].username = username;
-        }
-    }
-    
-    saveStorage(storage);
-    return storage[groupId][userId];
-}
+async function getUserData(groupId, userId, username) {
+    const client = await pool.connect();
+    try {
+        // Try to get existing user
+        let result = await client.query(
+            'SELECT username, wins, losses, streak FROM users WHERE group_id = $1 AND user_id = $2',
+            [groupId, userId]
+        );
 
-// Get clan for group
-function getClanForGroup(groupId) {
-    const clanData = loadClanStorage();
-    return clanData.groupClans[groupId] || null;
-}
-
-// Update clan activity (call whenever bot is used in a group)
-function updateClanActivity(groupId) {
-    const clanTag = getClanForGroup(groupId);
-    if (!clanTag) return; // Group doesn't have a clan
-    
-    const clanData = loadClanStorage();
-    if (clanData.clans[clanTag]) {
-        clanData.clans[clanTag].lastActivity = new Date().toISOString();
-        saveClanStorage(clanData);
-    }
-}
-
-// Update clan stats
-function updateClanStats(groupId, pointsToAdd = 1) {
-    const clanTag = getClanForGroup(groupId);
-    if (!clanTag) return; // Group doesn't have a clan
-    
-    const clanData = loadClanStorage();
-    if (clanData.clans[clanTag]) {
-        clanData.clans[clanTag].totalPoints += pointsToAdd;
-        clanData.clans[clanTag].wins += 1;
-        clanData.clans[clanTag].battles += 1;
-        clanData.clans[clanTag].lastActivity = new Date().toISOString(); // Update activity on battle win
-        clanData.globalStats.totalBattles += 1;
-        saveClanStorage(clanData);
-    }
-}
-
-// Get active clans (used bot within last 24 hours)
-function getActiveClans() {
-    const clanData = loadClanStorage();
-    const now = new Date();
-    const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-    
-    const activeClans = [];
-    
-    for (const [clanTag, clan] of Object.entries(clanData.clans)) {
-        const lastActivity = new Date(clan.lastActivity);
-        if (lastActivity > twentyFourHoursAgo) {
-            activeClans.push({ tag: clanTag, ...clan });
-        }
-    }
-    
-    return activeClans;
-}
-
-// Select daily clan winner
-async function selectDailyWinner() {
-    const clanData = loadClanStorage();
-    const today = new Date().toDateString();
-    
-    // Check if we already selected a winner today
-    if (clanData.globalStats.lastDailyWinDate === today) {
-        console.log('Daily winner already selected for today');
-        return null;
-    }
-    
-    const activeClans = getActiveClans();
-    
-    if (activeClans.length === 0) {
-        console.log('No active clans found for daily winner selection');
-        return null;
-    }
-    
-    // Random selection
-    const randomIndex = Math.floor(Math.random() * activeClans.length);
-    const winner = activeClans[randomIndex];
-    
-    // Update winner stats
-    clanData.clans[winner.tag].dailyWins += 1;
-    
-    // Update global stats
-    clanData.globalStats.lastDailyWinner = winner.tag;
-    clanData.globalStats.lastDailyWinDate = today;
-    
-    // Add to history
-    clanData.globalStats.dailyWinHistory.push({
-        date: today,
-        winnerClan: winner.tag,
-        totalActiveClans: activeClans.length
-    });
-    
-    // Keep only last 30 days of history
-    if (clanData.globalStats.dailyWinHistory.length > 30) {
-        clanData.globalStats.dailyWinHistory = clanData.globalStats.dailyWinHistory.slice(-30);
-    }
-    
-    saveClanStorage(clanData);
-    
-    console.log(`Daily winner selected: [${winner.tag}] from ${activeClans.length} active clans`);
-    
-    // Send announcements to all groups with clans
-    await announceDailyWinner(winner.tag, activeClans.length);
-    
-    return winner;
-}
-
-// Announce daily winner to all groups
-async function announceDailyWinner(winnerTag, totalActiveClans) {
-    const clanData = loadClanStorage();
-    
-    for (const [groupId, clanTag] of Object.entries(clanData.groupClans)) {
-        try {
-            const isWinner = clanTag === winnerTag;
-            const message = isWinner 
-                ? `🏆⚔️ DAILY CLAN VICTORY! ⚔️🏆\n\n🎉 Congratulations! [${winnerTag}] has been selected as today's DAILY WINNER!\n\n🎲 Selected from ${totalActiveClans} active clans worldwide!\n🔥 +1 Daily Win Point earned!\n\n⚔️ Use /global to see the updated clan leaderboard!`
-                : `🎯 Daily Clan Winner Selected! 🎯\n\n👑 Today's winner: [${winnerTag}]\n🎲 Selected from ${totalActiveClans} active clans\n\n💪 Keep using the bot daily to stay active and increase your chances!\n⚔️ Use /global to see the clan leaderboard!`;
+        if (result.rows.length === 0) {
+            // Create new user
+            await client.query(
+                `INSERT INTO users (group_id, user_id, username, wins, losses, streak) 
+                 VALUES ($1, $2, $3, 0, 0, 0)`,
+                [groupId, userId, username || 'Unknown']
+            );
             
-            await bot.telegram.sendMessage(groupId, message);
-        } catch (error) {
-            console.error(`Failed to send daily winner announcement to group ${groupId}:`, error);
-        }
-    }
-}
-
-// Update user stats
-function updateUserStats(groupId, winnerId, winnerUsername, loserId = null, loserUsername = null, isMegaBonk = false) {
-    const storage = loadStorage();
-    
-    // Ensure group exists
-    if (!storage[groupId]) {
-        storage[groupId] = {};
-    }
-    
-    // Ensure winner exists in storage
-    if (!storage[groupId][winnerId]) {
-        storage[groupId][winnerId] = {
-            username: winnerUsername || 'Unknown',
-            wins: 0,
-            losses: 0,
-            streak: 0
-        };
-    } else {
-        // Update username if provided
-        if (winnerUsername) {
-            storage[groupId][winnerId].username = winnerUsername;
-        }
-    }
-    
-    // Calculate points for win
-    const pointsEarned = isMegaBonk ? 2 : 1; // MEGA BONK gives double points
-    
-    // Update winner stats
-    storage[groupId][winnerId].wins += pointsEarned;
-    storage[groupId][winnerId].streak += 1;
-    
-    // Update loser (if provided - for 1v1 compatibility)
-    if (loserId && loserUsername) {
-        if (!storage[groupId][loserId]) {
-            storage[groupId][loserId] = {
-                username: loserUsername || 'Unknown',
+            return {
+                username: username || 'Unknown',
                 wins: 0,
                 losses: 0,
                 streak: 0
             };
         } else {
             // Update username if provided
-            if (loserUsername) {
-                storage[groupId][loserId].username = loserUsername;
+            if (username && username !== result.rows[0].username) {
+                await client.query(
+                    'UPDATE users SET username = $1, updated_at = CURRENT_TIMESTAMP WHERE group_id = $2 AND user_id = $3',
+                    [username, groupId, userId]
+                );
+                result.rows[0].username = username;
             }
+            
+            return result.rows[0];
+        }
+    } catch (error) {
+        console.error('Error in getUserData:', error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+// Get clan for group
+async function getClanForGroup(groupId) {
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            'SELECT clan_tag FROM group_clans WHERE group_id = $1',
+            [groupId]
+        );
+        
+        return result.rows.length > 0 ? result.rows[0].clan_tag : null;
+    } catch (error) {
+        console.error('Error in getClanForGroup:', error);
+        return null;
+    } finally {
+        client.release();
+    }
+}
+
+// Update clan activity (call whenever bot is used in a group)
+async function updateClanActivity(groupId) {
+    const clanTag = await getClanForGroup(groupId);
+    if (!clanTag) return; // Group doesn't have a clan
+    
+    const client = await pool.connect();
+    try {
+        await client.query(
+            'UPDATE clans SET last_activity = CURRENT_TIMESTAMP WHERE clan_tag = $1',
+            [clanTag]
+        );
+    } catch (error) {
+        console.error('Error updating clan activity:', error);
+    } finally {
+        client.release();
+    }
+}
+
+// Update clan stats
+async function updateClanStats(groupId, pointsToAdd = 1) {
+    const clanTag = await getClanForGroup(groupId);
+    if (!clanTag) return; // Group doesn't have a clan
+    
+    const client = await pool.connect();
+    try {
+        // Update clan stats
+        await client.query(
+            `UPDATE clans SET 
+             total_points = total_points + $1, 
+             wins = wins + 1, 
+             battles = battles + 1, 
+             last_activity = CURRENT_TIMESTAMP 
+             WHERE clan_tag = $2`,
+            [pointsToAdd, clanTag]
+        );
+        
+        // Update global stats
+        await client.query(
+            'UPDATE global_stats SET total_battles = total_battles + 1'
+        );
+    } catch (error) {
+        console.error('Error updating clan stats:', error);
+    } finally {
+        client.release();
+    }
+}
+
+// Get active clans (used bot within last 24 hours)
+async function getActiveClans() {
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            `SELECT clan_tag as tag, name, group_id, created_at, total_points, 
+                    member_count, wins, battles, daily_wins, last_activity 
+             FROM clans 
+             WHERE last_activity > NOW() - INTERVAL '24 hours'`
+        );
+        
+        return result.rows;
+    } catch (error) {
+        console.error('Error getting active clans:', error);
+        return [];
+    } finally {
+        client.release();
+    }
+}
+
+// Select daily clan winner
+async function selectDailyWinner() {
+    const client = await pool.connect();
+    try {
+        const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD format
+        
+        // Check if we already selected a winner today
+        const existingWinner = await client.query(
+            'SELECT last_daily_winner FROM global_stats WHERE last_daily_win_date = $1',
+            [today]
+        );
+        
+        if (existingWinner.rows.length > 0) {
+            console.log('Daily winner already selected for today');
+            return null;
         }
         
-        storage[groupId][loserId].losses += 1;
-        storage[groupId][loserId].streak = 0; // Reset streak on loss
+        const activeClans = await getActiveClans();
+        
+        if (activeClans.length === 0) {
+            console.log('No active clans found for daily winner selection');
+            return null;
+        }
+        
+        // Random selection
+        const randomIndex = Math.floor(Math.random() * activeClans.length);
+        const winner = activeClans[randomIndex];
+        
+        // Update winner stats
+        await client.query(
+            'UPDATE clans SET daily_wins = daily_wins + 1 WHERE clan_tag = $1',
+            [winner.tag]
+        );
+        
+        // Update global stats
+        await client.query(
+            'UPDATE global_stats SET last_daily_winner = $1, last_daily_win_date = $2',
+            [winner.tag, today]
+        );
+        
+        // Add to history
+        await client.query(
+            'INSERT INTO daily_win_history (date, winner_clan, total_active_clans) VALUES ($1, $2, $3)',
+            [today, winner.tag, activeClans.length]
+        );
+        
+        // Keep only last 30 days of history
+        await client.query(
+            'DELETE FROM daily_win_history WHERE date < $1',
+            [new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]]
+        );
+        
+        console.log(`Daily winner selected: [${winner.tag}] from ${activeClans.length} active clans`);
+        
+        // Send announcements to all groups with clans
+        await announceDailyWinner(winner.tag, activeClans.length);
+        
+        return winner;
+    } catch (error) {
+        console.error('Error selecting daily winner:', error);
+        return null;
+    } finally {
+        client.release();
     }
-    
-    saveStorage(storage);
-    
-    // Update clan stats if group has a clan
-    updateClanStats(groupId, pointsEarned);
+}
+
+// Announce daily winner to all groups
+async function announceDailyWinner(winnerTag, totalActiveClans) {
+    const client = await pool.connect();
+    try {
+        // Get all group-clan mappings
+        const result = await client.query('SELECT group_id, clan_tag FROM group_clans');
+        
+        for (const row of result.rows) {
+            try {
+                const isWinner = row.clan_tag === winnerTag;
+                const message = isWinner 
+                    ? `🏆⚔️ DAILY CLAN VICTORY! ⚔️🏆\n\n🎉 Congratulations! [${winnerTag}] has been selected as today's DAILY WINNER!\n\n🎲 Selected from ${totalActiveClans} active clans worldwide!\n🔥 +1 Daily Win Point earned!\n\n⚔️ Use /global to see the updated clan leaderboard!`
+                    : `🎯 Daily Clan Winner Selected! 🎯\n\n👑 Today's winner: [${winnerTag}]\n🎲 Selected from ${totalActiveClans} active clans\n\n💪 Keep using the bot daily to stay active and increase your chances!\n⚔️ Use /global to see the clan leaderboard!`;
+                
+                await bot.telegram.sendMessage(row.group_id, message);
+            } catch (error) {
+                console.error(`Failed to send daily winner announcement to group ${row.group_id}:`, error);
+            }
+        }
+    } catch (error) {
+        console.error('Error announcing daily winner:', error);
+    } finally {
+        client.release();
+    }
+}
+
+// Update user stats
+async function updateUserStats(groupId, winnerId, winnerUsername, loserId = null, loserUsername = null, isMegaBonk = false) {
+    const client = await pool.connect();
+    try {
+        // Calculate points for win
+        const pointsEarned = isMegaBonk ? 2 : 1; // MEGA BONK gives double points
+        
+        // Ensure winner exists and update stats
+        await client.query(
+            `INSERT INTO users (group_id, user_id, username, wins, losses, streak) 
+             VALUES ($1, $2, $3, $4, 0, 1)
+             ON CONFLICT (group_id, user_id) 
+             DO UPDATE SET 
+                username = $3,
+                wins = users.wins + $4,
+                streak = users.streak + 1,
+                updated_at = CURRENT_TIMESTAMP`,
+            [groupId, winnerId, winnerUsername || 'Unknown', pointsEarned]
+        );
+        
+        // Update loser (if provided - for 1v1 compatibility)
+        if (loserId && loserUsername) {
+            await client.query(
+                `INSERT INTO users (group_id, user_id, username, wins, losses, streak) 
+                 VALUES ($1, $2, $3, 0, 1, 0)
+                 ON CONFLICT (group_id, user_id) 
+                 DO UPDATE SET 
+                    username = $3,
+                    losses = users.losses + 1,
+                    streak = 0,
+                    updated_at = CURRENT_TIMESTAMP`,
+                [groupId, loserId, loserUsername || 'Unknown']
+            );
+        }
+        
+        // Update clan stats if group has a clan
+        await updateClanStats(groupId, pointsEarned);
+    } catch (error) {
+        console.error('Error updating user stats:', error);
+    } finally {
+        client.release();
+    }
 }
 
 // Get leaderboard
-function getLeaderboard(groupId) {
-    const storage = loadStorage();
-    
-    if (!storage[groupId]) {
+async function getLeaderboard(groupId) {
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            `SELECT user_id as userId, username, wins, losses, streak 
+             FROM users 
+             WHERE group_id = $1 
+             ORDER BY wins DESC 
+             LIMIT 20`,
+            [groupId]
+        );
+        
+        return result.rows;
+    } catch (error) {
+        console.error('Error getting leaderboard:', error);
         return [];
+    } finally {
+        client.release();
     }
-    
-    return Object.entries(storage[groupId])
-        .map(([userId, data]) => ({ userId, ...data }))
-        .sort((a, b) => b.wins - a.wins)
-        .slice(0, 20);
 }
 
 // Parse user mention from text
@@ -444,7 +618,7 @@ async function playBattleRound(ctx, battleState) {
             await ctx.reply(victoryMessage);
             
             // Update winner stats - now correctly passing the megaBonk status
-            updateUserStats(groupId, winner.id, winner.username, null, null, megaBonk);
+            await updateUserStats(groupId, winner.id, winner.username, null, null, megaBonk);
         }
         
         // Cleanup
@@ -503,7 +677,7 @@ bot.command('createclan', async (ctx) => {
     }
     
     const groupId = ctx.chat.id.toString();
-    updateClanActivity(groupId); // Track activity
+    await updateClanActivity(groupId); // Track activity
     const args = ctx.message.text.split(' ').slice(1);
     
     if (args.length === 0) {
@@ -517,38 +691,54 @@ bot.command('createclan', async (ctx) => {
         return ctx.reply('❌ Clan tag must be exactly 4 letters (A-Z only)!\n\nExample: /createclan BONK');
     }
     
-    const clanData = loadClanStorage();
-    
-    // Check if group already has a clan
-    if (clanData.groupClans[groupId]) {
-        const existingTag = clanData.groupClans[groupId];
-        return ctx.reply(`⚔️ This group already has clan tag: [${existingTag}]\n\nUse /rank to see your clan info!`);
+    const client = await pool.connect();
+    try {
+        // Check if group already has a clan
+        const existingClan = await client.query(
+            'SELECT clan_tag FROM group_clans WHERE group_id = $1',
+            [groupId]
+        );
+        
+        if (existingClan.rows.length > 0) {
+            const existingTag = existingClan.rows[0].clan_tag;
+            return ctx.reply(`⚔️ This group already has clan tag: [${existingTag}]\n\nUse /rank to see your clan info!`);
+        }
+        
+        // Check if clan tag is taken
+        const takenClan = await client.query(
+            'SELECT clan_tag FROM clans WHERE clan_tag = $1',
+            [clanTag]
+        );
+        
+        if (takenClan.rows.length > 0) {
+            return ctx.reply(`❌ Clan tag [${clanTag}] is already taken!\n\nTry a different 4-letter combination.`);
+        }
+        
+        // Create the clan
+        await client.query(
+            `INSERT INTO clans (clan_tag, name, group_id, total_points, member_count, wins, battles, daily_wins, last_activity) 
+             VALUES ($1, $2, $3, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP)`,
+            [clanTag, clanTag, groupId]
+        );
+        
+        // Create group-clan mapping
+        await client.query(
+            'INSERT INTO group_clans (group_id, clan_tag) VALUES ($1, $2)',
+            [groupId, clanTag]
+        );
+        
+        // Update global stats
+        await client.query(
+            'UPDATE global_stats SET total_clans = total_clans + 1'
+        );
+        
+        await ctx.reply(`🔥⚔️ CLAN [${clanTag}] CREATED! ⚔️🔥\n\n🏷️ Your group is now part of the global SUPERBONK clan wars!\n📊 Use /rank to see your progress\n🌍 Use /global to see all clans\n\n💀 Every battle royale victory now earns points for your clan! Let the wars begin!`);
+    } catch (error) {
+        console.error('Error creating clan:', error);
+        await ctx.reply('❌ Error creating clan. Please try again later.');
+    } finally {
+        client.release();
     }
-    
-    // Check if clan tag is taken
-    if (clanData.clans[clanTag]) {
-        return ctx.reply(`❌ Clan tag [${clanTag}] is already taken!\n\nTry a different 4-letter combination.`);
-    }
-    
-    // Create the clan
-    clanData.clans[clanTag] = {
-        name: clanTag,
-        groupId: groupId,
-        createdAt: new Date().toISOString(),
-        totalPoints: 0,
-        memberCount: 0,
-        wins: 0,
-        battles: 0,
-        dailyWins: 0,
-        lastActivity: new Date().toISOString()
-    };
-    
-    clanData.groupClans[groupId] = clanTag;
-    clanData.globalStats.totalClans += 1;
-    
-    saveClanStorage(clanData);
-    
-    await ctx.reply(`🔥⚔️ CLAN [${clanTag}] CREATED! ⚔️🔥\n\n🏷️ Your group is now part of the global SUPERBONK clan wars!\n📊 Use /rank to see your progress\n🌍 Use /global to see all clans\n\n💀 Every battle royale victory now earns points for your clan! Let the wars begin!`);
 });
 
 // Command: /rank - Show clan statistics
@@ -558,64 +748,81 @@ bot.command('rank', async (ctx) => {
     }
     
     const groupId = ctx.chat.id.toString();
-    updateClanActivity(groupId); // Track activity
-    const clanTag = getClanForGroup(groupId);
+    await updateClanActivity(groupId); // Track activity
+    const clanTag = await getClanForGroup(groupId);
     
     if (!clanTag) {
         return ctx.reply('❌ This group doesn\'t have a clan yet!\n\nCreate one with: /createclan ABCD\n\n⚔️ Join the global clan wars!');
     }
     
-    const clanData = loadClanStorage();
-    const clan = clanData.clans[clanTag];
-    
-    if (!clan) {
-        return ctx.reply('❌ Clan data not found! Please contact support.');
+    const client = await pool.connect();
+    try {
+        const clanResult = await client.query(
+            'SELECT * FROM clans WHERE clan_tag = $1',
+            [clanTag]
+        );
+        
+        if (clanResult.rows.length === 0) {
+            return ctx.reply('❌ Clan data not found! Please contact support.');
+        }
+        
+        const clan = clanResult.rows[0];
+        
+        // Calculate clan ranking
+        const allClansResult = await client.query(
+            'SELECT clan_tag, daily_wins FROM clans ORDER BY daily_wins DESC'
+        );
+        
+        const rank = allClansResult.rows.findIndex(c => c.clan_tag === clanTag) + 1;
+        const lastActivity = new Date(clan.last_activity).toLocaleDateString();
+        
+        const message = `⚔️ CLAN [${clanTag}] STATS ⚔️\n\n` +
+                       `🏆 Global Rank: #${rank} of ${allClansResult.rows.length}\n` +
+                       `🎯 Daily Wins: ${clan.daily_wins}\n` +
+                       `⚔️ Battle Royale Wins: ${clan.wins}\n` +
+                       `📅 Created: ${new Date(clan.created_at).toLocaleDateString()}\n` +
+                       `🕒 Last Active: ${lastActivity}\n\n` +
+                       `🎲 Daily winners are selected randomly from active clans!\n` +
+                       `🌍 Compete against ${allClansResult.rows.length - 1} other clans worldwide!`;
+        
+        await ctx.reply(message);
+    } catch (error) {
+        console.error('Error getting clan rank:', error);
+        await ctx.reply('❌ Error getting clan info. Please try again later.');
+    } finally {
+        client.release();
     }
-    
-    // Calculate clan ranking
-    const allClans = Object.entries(clanData.clans)
-        .map(([tag, data]) => ({ tag, ...data }))
-        .sort((a, b) => b.dailyWins - a.dailyWins);
-    
-    const rank = allClans.findIndex(c => c.tag === clanTag) + 1;
-    const lastActivity = new Date(clan.lastActivity).toLocaleDateString();
-    
-    const message = `⚔️ CLAN [${clanTag}] STATS ⚔️\n\n` +
-                   `🏆 Global Rank: #${rank} of ${allClans.length}\n` +
-                   `🎯 Daily Wins: ${clan.dailyWins}\n` +
-                   `⚔️ Battle Royale Wins: ${clan.wins}\n` +
-                   `📅 Created: ${new Date(clan.createdAt).toLocaleDateString()}\n` +
-                   `🕒 Last Active: ${lastActivity}\n\n` +
-                   `🎲 Daily winners are selected randomly from active clans!\n` +
-                   `🌍 Compete against ${allClans.length - 1} other clans worldwide!`;
-    
-    await ctx.reply(message);
 });
 
 // Command: /global - Show global clan rankings
 bot.command('global', async (ctx) => {
-    const clanData = loadClanStorage();
-    
-    if (Object.keys(clanData.clans).length === 0) {
-        return ctx.reply('🌍 No clans exist yet!\n\nBe the first to create one: /createclan ABCD\n\n⚔️ Start the global clan wars!');
+    const client = await pool.connect();
+    try {
+        const allClansResult = await client.query(
+            'SELECT clan_tag as tag, daily_wins, last_activity FROM clans ORDER BY daily_wins DESC LIMIT 20'
+        );
+        
+        if (allClansResult.rows.length === 0) {
+            return ctx.reply('🌍 No clans exist yet!\n\nBe the first to create one: /createclan ABCD\n\n⚔️ Start the global clan wars!');
+        }
+        
+        let message = '🌍⚔️ GLOBAL CLAN LEADERBOARD ⚔️🌍\n🎯 Ranked by Daily Wins (Random Daily Selection)\n\n';
+        
+        allClansResult.rows.forEach((clan, index) => {
+            const trophy = index === 0 ? '👑' : index === 1 ? '🥈' : index === 2 ? '🥉' : '⚔️';
+            const lastActivity = new Date(clan.last_activity).toLocaleDateString();
+            message += `${trophy} [${clan.tag}] – ${clan.daily_wins} Daily Wins (Last active: ${lastActivity})\n`;
+        });
+        
+        message += `\n🔥 ${allClansResult.rows.length} clans competing worldwide!\n💀 Create your clan: /createclan ABCD`;
+        
+        await ctx.reply(message);
+    } catch (error) {
+        console.error('Error getting global leaderboard:', error);
+        await ctx.reply('❌ Error getting clan leaderboard. Please try again later.');
+    } finally {
+        client.release();
     }
-    
-    const allClans = Object.entries(clanData.clans)
-        .map(([tag, data]) => ({ tag, ...data }))
-        .sort((a, b) => b.dailyWins - a.dailyWins)
-        .slice(0, 20);
-    
-    let message = '🌍⚔️ GLOBAL CLAN LEADERBOARD ⚔️🌍\n🎯 Ranked by Daily Wins (Random Daily Selection)\n\n';
-    
-    allClans.forEach((clan, index) => {
-        const trophy = index === 0 ? '👑' : index === 1 ? '🥈' : index === 2 ? '🥉' : '⚔️';
-        const lastActivity = new Date(clan.lastActivity).toLocaleDateString();
-        message += `${trophy} [${clan.tag}] – ${clan.dailyWins} Daily Wins (Last active: ${lastActivity})\n`;
-    });
-    
-    message += `\n🔥 ${allClans.length} clans competing worldwide!\n💀 Create your clan: /createclan ABCD`;
-    
-    await ctx.reply(message);
 });
 
 // Command: /clansearch - Search for clans by tag
@@ -662,7 +869,7 @@ bot.command('jail', async (ctx) => {
     }
     
     const groupId = ctx.chat.id.toString();
-    updateClanActivity(groupId); // Track activity
+    await updateClanActivity(groupId); // Track activity
     const senderId = ctx.from.id.toString();
     const senderUsername = ctx.from.username || ctx.from.first_name || 'Unknown';
     
@@ -716,7 +923,7 @@ bot.command('bonk', async (ctx) => {
     }
     
     const groupId = ctx.chat.id.toString();
-    updateClanActivity(groupId); // Track activity
+    await updateClanActivity(groupId); // Track activity
     const userId = ctx.from.id.toString();
     const username = ctx.from.username || ctx.from.first_name || 'Unknown';
     
@@ -791,8 +998,8 @@ bot.command('leaderboard', async (ctx) => {
     }
     
     const groupId = ctx.chat.id.toString();
-    updateClanActivity(groupId); // Track activity
-    const leaderboard = getLeaderboard(groupId);
+    await updateClanActivity(groupId); // Track activity
+    const leaderboard = await getLeaderboard(groupId);
     
     if (leaderboard.length === 0) {
         return ctx.reply('🏆⚔️ SUPERBONK BATTLE ROYALE LEADERBOARD ⚔️🏆\n\nNo battles yet! Start a battle royale with /bonk! 💀');
@@ -811,43 +1018,61 @@ bot.command('leaderboard', async (ctx) => {
 
 // Command: /dailywinner - Show today's daily winner
 bot.command('dailywinner', async (ctx) => {
-    const clanData = loadClanStorage();
-    const today = new Date().toDateString();
-    
-    if (clanData.globalStats.lastDailyWinDate === today) {
-        const winner = clanData.globalStats.lastDailyWinner;
-        const winnerClan = clanData.clans[winner];
-        const totalActiveClans = getActiveClans().length;
+    const client = await pool.connect();
+    try {
+        const today = new Date().toISOString().split('T')[0];
         
-        await ctx.reply(`🏆 TODAY'S DAILY CLAN WINNER 🏆\n\n👑 Winner: [${winner}]\n🎲 Selected from ${totalActiveClans} active clans\n🕐 Selected at 12:00 PM UTC\n\n⚔️ Use /global to see updated leaderboard!\n💪 Use the bot daily to keep your clan active!`);
-    } else {
-        const activeClans = getActiveClans();
-        await ctx.reply(`⏰ NO WINNER SELECTED YET TODAY ⏰\n\n🎯 Current active clans: ${activeClans.length}\n🕐 Next selection: 12:00 PM UTC\n\n💪 Use the bot to keep your clan active and eligible!\n📊 Active = used bot within last 24 hours`);
+        const globalStatsResult = await client.query(
+            'SELECT last_daily_winner, last_daily_win_date FROM global_stats WHERE last_daily_win_date = $1',
+            [today]
+        );
+        
+        if (globalStatsResult.rows.length > 0) {
+            const winner = globalStatsResult.rows[0].last_daily_winner;
+            const totalActiveClans = (await getActiveClans()).length;
+            
+            await ctx.reply(`🏆 TODAY'S DAILY CLAN WINNER 🏆\n\n👑 Winner: [${winner}]\n🎲 Selected from ${totalActiveClans} active clans\n🕐 Selected at 12:00 PM UTC\n\n⚔️ Use /global to see updated leaderboard!\n💪 Use the bot daily to keep your clan active!`);
+        } else {
+            const activeClans = await getActiveClans();
+            await ctx.reply(`⏰ NO WINNER SELECTED YET TODAY ⏰\n\n🎯 Current active clans: ${activeClans.length}\n🕐 Next selection: 12:00 PM UTC\n\n💪 Use the bot to keep your clan active and eligible!\n📊 Active = used bot within last 24 hours`);
+        }
+    } catch (error) {
+        console.error('Error getting daily winner:', error);
+        await ctx.reply('❌ Error getting daily winner info. Please try again later.');
+    } finally {
+        client.release();
     }
 });
 
 // Command: /dailyhistory - Show recent daily winner history
 bot.command('dailyhistory', async (ctx) => {
-    const clanData = loadClanStorage();
-    const history = clanData.globalStats.dailyWinHistory || [];
-    
-    if (history.length === 0) {
-        return ctx.reply('📚 NO DAILY HISTORY YET 📚\n\nDaily winner selection starts once clans are created!\n\n⚔️ Create a clan: /createclan ABCD\n🕐 Winners selected daily at 12:00 PM UTC');
+    const client = await pool.connect();
+    try {
+        const historyResult = await client.query(
+            'SELECT date, winner_clan, total_active_clans FROM daily_win_history ORDER BY date DESC LIMIT 10'
+        );
+        
+        if (historyResult.rows.length === 0) {
+            return ctx.reply('📚 NO DAILY HISTORY YET 📚\n\nDaily winner selection starts once clans are created!\n\n⚔️ Create a clan: /createclan ABCD\n🕐 Winners selected daily at 12:00 PM UTC');
+        }
+        
+        let message = '📚⚔️ RECENT DAILY WINNERS ⚔️📚\n\n';
+        
+        historyResult.rows.forEach((entry, index) => {
+            const icon = index === 0 ? '🏆' : '📅';
+            const formattedDate = new Date(entry.date).toDateString();
+            message += `${icon} ${formattedDate}: [${entry.winner_clan}] (${entry.total_active_clans} active clans)\n`;
+        });
+        
+        message += `\n🎯 Showing last ${historyResult.rows.length} days\n🎲 Winners selected randomly from active clans\n⚔️ Use /global for current leaderboard`;
+        
+        await ctx.reply(message);
+    } catch (error) {
+        console.error('Error getting daily history:', error);
+        await ctx.reply('❌ Error getting daily history. Please try again later.');
+    } finally {
+        client.release();
     }
-    
-    let message = '📚⚔️ RECENT DAILY WINNERS ⚔️📚\n\n';
-    
-    // Show last 10 days
-    const recentHistory = history.slice(-10).reverse();
-    
-    recentHistory.forEach((entry, index) => {
-        const icon = index === 0 ? '🏆' : '📅';
-        message += `${icon} ${entry.date}: [${entry.winnerClan}] (${entry.totalActiveClans} active clans)\n`;
-    });
-    
-    message += `\n🎯 Showing last ${recentHistory.length} days\n🎲 Winners selected randomly from active clans\n⚔️ Use /global for current leaderboard`;
-    
-    await ctx.reply(message);
 });
 
 // Command: /bonkstats
@@ -863,21 +1088,25 @@ bot.command('bonkstats', async (ctx) => {
     let userId, username;
     
     if (targetUsername) {
-        // Try to find user in storage by username
-        const storage = loadStorage();
-        if (storage[groupId]) {
-            const userEntry = Object.entries(storage[groupId]).find(([id, data]) => 
-                data.username.toLowerCase() === targetUsername.toLowerCase()
+        // Try to find user in database by username
+        const client = await pool.connect();
+        try {
+            const userResult = await client.query(
+                'SELECT user_id, username FROM users WHERE group_id = $1 AND LOWER(username) = LOWER($2)',
+                [groupId, targetUsername]
             );
             
-            if (userEntry) {
-                userId = userEntry[0];
-                username = userEntry[1].username;
+            if (userResult.rows.length > 0) {
+                userId = userResult.rows[0].user_id;
+                username = userResult.rows[0].username;
             } else {
                 return ctx.reply(`📊 User @${targetUsername} not found in BONK records! They need to participate in a duel first! 🤷‍♂️`);
             }
-        } else {
+        } catch (error) {
+            console.error('Error finding user:', error);
             return ctx.reply(`📊 User @${targetUsername} not found in BONK records! They need to participate in a duel first! 🤷‍♂️`);
+        } finally {
+            client.release();
         }
     } else {
         // Show stats for command sender
@@ -885,7 +1114,7 @@ bot.command('bonkstats', async (ctx) => {
         username = ctx.from.username || ctx.from.first_name || 'Unknown';
     }
     
-    const userData = getUserData(groupId, userId, username);
+    const userData = await getUserData(groupId, userId, username);
     const winRate = userData.wins + userData.losses > 0 ? 
         Math.round((userData.wins / (userData.wins + userData.losses)) * 100) : 0;
     
@@ -951,6 +1180,9 @@ bot.catch((err, ctx) => {
 // Start bot
 async function startBot() {
     try {
+        // Initialize database schema
+        await initializeDatabase();
+        
         await bot.launch();
         console.log('🔥⚔️ SUPERBONK Battle Royale Bot is running! Ready for chaos! ⚔️🔥');
         
