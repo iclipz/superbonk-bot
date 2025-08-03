@@ -1,0 +1,26 @@
+{
+  "name": "superbonk-telegram-bot",
+  "version": "1.0.0",
+  "description": "A fun Telegram bot for 1v1 BONK duels in group chats",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "game",
+    "duel",
+    "bonk"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "telegraf": "^4.15.0",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
