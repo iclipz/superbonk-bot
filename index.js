@@ -17,8 +17,15 @@ const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
 
-// Initialize bot
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// Initialize bot with fallback for Railway
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) {
+    console.error('BOT_TOKEN environment variable is not set!');
+    console.log('Available environment variables:', Object.keys(process.env).filter(key => key.includes('BOT')));
+    process.exit(1);
+}
+
+const bot = new Telegraf(BOT_TOKEN);
 
 // Storage file path
 const STORAGE_FILE = path.join(__dirname, 'bonk_data.json');
